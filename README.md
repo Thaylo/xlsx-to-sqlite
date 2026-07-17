@@ -77,6 +77,10 @@ documents the file-format traps for when a file misbehaves.
 - structural diagnostics with stable codes — stacked tables in one sheet,
   repeated headers, title rows, layout artifacts — each with a recovery
   playbook in [references/error-codes.md](references/error-codes.md)
+- `--compress`: big prose columns stored as lossless zlib BLOBs (~2x smaller
+  on article-like text; the rest of the DB stays plain and fully queryable) —
+  read them via `scripts/zquery.py` or a one-line `unz()` UDF;
+  `scripts/compress_db.py` shrinks databases you already have
 
 ## Tests
 

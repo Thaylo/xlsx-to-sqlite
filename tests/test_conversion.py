@@ -307,6 +307,48 @@ def test_remote_no_range_support(tmp):
     print("PASS E06 on servers without range support")
 
 
+def test_compress_roundtrip(tmp):
+    """--compress: prose columns become zlib BLOBs, unz() restores them
+    byte-for-byte, short columns stay plain, and the file shrinks."""
+    prose = "the quick brown fox jumps over the lazy dog. " * 12  # ~540 B
+    rows = [_cells(1, ["ID", "Tag", "Body"])]
+    for i in range(2, 402):
+        rows.append(_cells(i, [f"a{i}", f"t{i % 7}", f"{prose}#{i}"]))
+    xlsx = os.path.join(tmp, "blog.xlsx")
+    write_xlsx(xlsx, ["Posts"], [sheet(rows)])
+
+    plain_db = os.path.join(tmp, "plain.sqlite")
+    comp_db = os.path.join(tmp, "comp.sqlite")
+    convert(xlsx, plain_db)
+    conn, log = convert(xlsx, comp_db, "--compress")
+    assert "compressing column(s) ['body']" in log, log
+
+    assert conn.execute("SELECT typeof(body) FROM posts LIMIT 1").fetchone()[0] == "blob"
+    assert conn.execute("SELECT typeof(tag) FROM posts LIMIT 1").fetchone()[0] == "text"
+    assert conn.execute("SELECT tbl, col, codec FROM _compressed_columns").fetchall() \
+        == [("posts", "body", "zlib")]
+    import zlib as _z
+    blob = conn.execute("SELECT body FROM posts WHERE id='a77'").fetchone()[0]
+    assert _z.decompress(blob).decode() == f"{prose}#77"
+    assert os.path.getsize(comp_db) < os.path.getsize(plain_db) / 3
+
+    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "zquery.py"),
+                        comp_db, "SELECT unz(body) FROM posts WHERE id='a99'"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and f"{prose}#99" in r.stdout, r.stdout + r.stderr
+
+    # compress_db.py: same result starting from the already-plain database
+    comp2 = os.path.join(tmp, "comp2.sqlite")
+    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "compress_db.py"),
+                        plain_db, comp2], capture_output=True, text=True)
+    assert r.returncode == 0 and "compressing ['body']" in r.stdout, r.stdout + r.stderr
+    c2 = sqlite3.connect(comp2)
+    blob = c2.execute("SELECT body FROM posts WHERE id='a77'").fetchone()[0]
+    assert _z.decompress(blob).decode() == f"{prose}#77"
+    assert c2.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == 400
+    print("PASS --compress + zquery + compress_db roundtrip")
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         test_inline_sparse_dirty_headers(tmp)
@@ -315,4 +357,5 @@ if __name__ == "__main__":
         test_title_row_diagnostic(tmp)
         test_remote_streaming(tmp)
         test_remote_no_range_support(tmp)
+        test_compress_roundtrip(tmp)
     print("ALL TESTS PASS")

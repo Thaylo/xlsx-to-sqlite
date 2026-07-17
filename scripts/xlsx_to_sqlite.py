@@ -29,6 +29,7 @@ import unicodedata
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
@@ -42,6 +43,7 @@ BUILTIN_DATE_FMTS = (
 )
 SNIFF_ROWS = 2000
 GAP_ROWS = 3  # this many consecutive blank rows inside data smells like stacked tables
+COMPRESS_MIN_AVG = 256  # --compress targets TEXT columns averaging more bytes than this
 
 
 # ---------- remote input: convert while downloading ----------
@@ -430,8 +432,34 @@ def convert_sheet(conn, zf, sheet_name, member, shared, date_styles, epoch, opts
     else:
         headers = [sanitize(headers_src.get(i), i, seen_cols) for i in range(width)]
     types = sniff_types(buffer, width)
+
+    # --compress: big prose columns become zlib BLOBs (lossless; read via unz())
+    comp_idx = set()
+    if opts.compress:
+        lens, cnts = {}, {}
+        for _, row in buffer:
+            for i, v in row.items():
+                if isinstance(v, str):
+                    lens[i] = lens.get(i, 0) + len(v)
+                    cnts[i] = cnts.get(i, 0) + 1
+        comp_idx = {i for i in range(width)
+                    if types[i] == "TEXT" and cnts.get(i, 0) >= 10
+                    and lens[i] / cnts[i] > COMPRESS_MIN_AVG}
+        for i in comp_idx:
+            types[i] = "BLOB"
+        if comp_idx:
+            names = [headers[i] for i in sorted(comp_idx)]
+            print(f"  compressing column(s) {names} (zlib; read with unz() — "
+                  "see scripts/zquery.py)", flush=True)
+
     cols_sql = ", ".join(f'"{h}" {t}' for h, t in zip(headers, types))
     conn.execute(f'CREATE TABLE "{table}" ({cols_sql})')
+    if comp_idx:
+        conn.execute("CREATE TABLE IF NOT EXISTS _compressed_columns "
+                     "(tbl TEXT, col TEXT, codec TEXT)")
+        for i in sorted(comp_idx):
+            conn.execute("INSERT INTO _compressed_columns VALUES (?, ?, 'zlib')",
+                         (table, headers[i]))
     insert = f'INSERT INTO "{table}" VALUES ({",".join("?" * width)})'
 
     t0, total, batch, last_report = time.time(), 0, [], time.time()
@@ -476,6 +504,10 @@ def convert_sheet(conn, zf, sheet_name, member, shared, date_styles, epoch, opts
         if not cells:
             return
         scan(rownum, cells)
+        if comp_idx:
+            cells = {i: (zlib.compress(v.encode("utf-8"), 6)
+                         if i in comp_idx and isinstance(v, str) else v)
+                     for i, v in cells.items()}
         for i in cells:
             counts[i] = counts.get(i, 0) + 1
         if max(cells) >= width:
@@ -556,6 +588,10 @@ def main():
     p.add_argument("--sample", type=int, default=3, help="sample rows to print per table at the end")
     p.add_argument("--force", action="store_true", help="overwrite an existing output file")
     p.add_argument("--ignore-space", action="store_true", help="skip the free-disk check")
+    p.add_argument("--compress", action="store_true",
+                   help="store big prose TEXT columns as zlib BLOBs (lossless, "
+                        "~2x smaller on article-like text); read them with "
+                        "scripts/zquery.py or a one-line unz() UDF")
     opts = p.parse_args()
 
     remote = None
@@ -628,7 +664,15 @@ def main():
     for table, count, headers in results:
         print(f"  {table}: {count:,} rows, columns: {headers}")
         for row in conn.execute(f'SELECT * FROM "{table}" LIMIT {opts.sample}'):
-            print("    " + " | ".join(str(v)[:60] for v in row))
+            print("    " + " | ".join(
+                f"<zlib {len(v)} B>" if isinstance(v, bytes) else str(v)[:60]
+                for v in row))
+    if opts.compress:
+        meta = conn.execute("SELECT tbl, col FROM _compressed_columns").fetchall() \
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='_compressed_columns'").fetchone() else []
+        if meta:
+            print(f"compressed columns: {['%s.%s' % m for m in meta]} — query them with "
+                  f"python3 scripts/zquery.py {out} \"SELECT unz(col) ...\"")
     if remote:
         print(f"network: {remote.fetched / 1e9:.2f} GB fetched via ranged requests "
               "(no local .xlsx copy was written)")

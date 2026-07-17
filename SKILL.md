@@ -111,6 +111,22 @@ one working example query. Suggest `sqlite3` CLI or DB Browser for SQLite for
 GUIs, and warn that `SELECT *` without `LIMIT` on a table with big text columns
 re-creates the original problem.
 
+## Shrinking the output
+
+SQLite stores data uncompressed, so the .sqlite lands near the size of the
+*uncompressed* sheet XML — often 3x the .xlsx, which is a zip. That is not
+bloat (overhead is ~15-20%); it's the real size of the data. When the dump is
+dominated by prose columns (article bodies, descriptions, logs), `--compress`
+stores those columns as per-row zlib BLOBs: lossless, ~2x smaller on unique
+prose (entropy-bound — don't promise more), detected automatically (TEXT
+columns averaging >256 bytes). Everything else — filters, aggregates, indexes
+on the plain columns — works unchanged; reading the compressed text needs
+`unz()`, provided by `scripts/zquery.py` or one line of app code (printed in
+the tool's output). `scripts/compress_db.py` applies the same treatment to an
+already-existing database. Skip compression when the user needs the file to
+open cleanly in GUI tools with all text visible, or when columns are short —
+sub-256-byte values barely compress and the BLOB indirection isn't worth it.
+
 ## When something looks wrong
 
 The converter emits stable diagnostic codes — `WARN [W01..W07]` for structural
