@@ -1,70 +1,81 @@
 # xlsx-to-sqlite
 
-An [Agent Skill](https://agentskills.io) that lets AI coding agents convert
-huge Excel dumps — hundreds of MB to multiple GB — into queryable SQLite
-databases, with flat memory use and zero dependencies beyond the Python
-standard library.
+Convert huge Excel dumps — hundreds of MB to multiple GB — into queryable
+SQLite databases. Works both as an [Agent Skill](https://agentskills.io) for AI
+coding agents and as a standalone CLI. No dependencies: Python standard
+library only.
 
-A `.xlsx` file is a zip of XML, and the worksheet XML is typically 3–10x the
-file's size on disk. That's why big exports crash Excel, hang pandas, and OOM
-openpyxl: they all try to hold that XML in memory. The converter here streams
-it instead, so a 10-million-row file costs the same RAM as a 10-thousand-row
-one. Validated on a real-world 800k+ row / 1.4 GB single-sheet export:
-~9,000 rows/s at constant memory.
+A `.xlsx` is a zip of XML that expands to 3–10x its size on disk — that's why
+big exports crash Excel and OOM pandas/openpyxl, which hold it all in memory.
+This converter streams it instead: a 10-million-row file costs the same RAM as
+a 10-thousand-row one. Validated on a real-world 800k+ row / 1.4 GB export at
+~9,000 rows/s with constant memory.
 
-## For AI agents (the skill)
+## Requirements
 
-Install into any agent runtime that supports Agent Skills, e.g. Claude Code:
+Python 3.8+ — nothing else.
 
-```bash
-git clone https://github.com/Thaylo/xlsx-to-sqlite ~/.claude/skills/xlsx-to-sqlite
-```
+- **Debian/Ubuntu**: usually preinstalled; otherwise `sudo apt install python3`
+- **macOS**: preinstalled (or `brew install python`)
+- **Windows 10+**: `winget install Python.Python.3.12` (or the Microsoft
+  Store), then use `py` wherever the examples say `python3`
 
-From then on, prompts like *"this excel export won't open, turn it into
-something I can query"* trigger a workflow that inspects the file first
-(`--peek`), checks free disk before writing gigabytes, converts via the
-streaming script, verifies row counts against the source, and adds indexes for
-likely queries. `SKILL.md` is the agent-facing playbook;
-`references/xlsx-internals.md` documents the file-format traps (sparse rows,
-date serials, sharedStrings, the 1904 epoch) for when a file misbehaves.
-
-## For humans (the script standalone)
-
-No agent required — it's a plain CLI:
+## Quick start (CLI)
 
 ```bash
-python3 scripts/xlsx_to_sqlite.py dump.xlsx --peek          # look before you leap
-python3 scripts/xlsx_to_sqlite.py dump.xlsx                 # all sheets -> dump.sqlite
+git clone https://github.com/Thaylo/xlsx-to-sqlite
+cd xlsx-to-sqlite
+
+python3 scripts/xlsx_to_sqlite.py dump.xlsx --peek   # inspect sheets + first rows
+python3 scripts/xlsx_to_sqlite.py dump.xlsx          # convert -> dump.sqlite
 python3 scripts/xlsx_to_sqlite.py dump.xlsx --sheet "Sales" -o sales.sqlite
 ```
 
-What you get:
-
-- one table per sheet, column names sanitized to SQL-safe identifiers
-  (`"Unit Price (R$)"` → `unit_price_r`, duplicates deduped, accents stripped)
-- Excel date serials converted to ISO 8601 text (`45366` → `2024-03-15`),
-  detected from the workbook's styles, including the Mac 1904-epoch variant
-- sparse rows mapped by cell reference — missing cells become NULL in the
-  right column, values never shift left
-- INTEGER/REAL/TEXT affinities sniffed from the data
-- resilience to writer quirks: inline strings or sharedStrings, missing `r=`
-  attributes, rows wider than the header, phonetic (furigana) runs
-- a free-disk check before writing (the output is roughly the size of the
-  uncompressed XML — about 10x the .xlsx), refusal to overwrite without
-  `--force`, progress with rows/s, and a verification summary with sample rows
+Then query with the `sqlite3` CLI or any GUI (e.g.
+[DB Browser for SQLite](https://sqlitebrowser.org/) — Linux/macOS/Windows).
 
 Useful flags: `--header-row N` (junk rows above the header), `--no-header`,
-`--sheet NAME` (repeatable), `--batch N`, `--ignore-space`.
+`--sheet NAME` (repeatable), `--force` (overwrite), `--ignore-space` (skip the
+free-disk check).
+
+## Install as an Agent Skill
+
+Give the skill to an agent runtime that supports Agent Skills (e.g. Claude
+Code) by cloning into its skills folder:
+
+```bash
+# Linux / macOS
+git clone https://github.com/Thaylo/xlsx-to-sqlite ~/.claude/skills/xlsx-to-sqlite
+
+# Windows (PowerShell)
+git clone https://github.com/Thaylo/xlsx-to-sqlite "$env:USERPROFILE\.claude\skills\xlsx-to-sqlite"
+```
+
+From then on, prompts like *"this excel export won't open, turn it into
+something I can query"* make the agent inspect the file, check free disk,
+stream-convert, verify row counts against the source, and add useful indexes.
+`SKILL.md` is the agent-facing playbook; `references/xlsx-internals.md`
+documents the file-format traps for when a file misbehaves.
+
+## What you get
+
+- one table per sheet; column names sanitized to SQL-safe identifiers
+  (`"Unit Price ($)"` → `unit_price`, duplicates deduped, accents stripped)
+- Excel date serials → ISO 8601 text (`45366` → `2024-03-15`), detected from
+  the workbook styles, including the Mac 1904-epoch variant
+- sparse rows mapped by cell reference: missing cells become NULL in the right
+  column — values never shift left
+- INTEGER/REAL/TEXT column affinities sniffed from the data
+- handles sharedStrings and inline strings, missing `r=` attributes, rows
+  wider than the header, phonetic (furigana) runs
+- free-disk check before writing (output ≈ 10x the .xlsx size), refusal to
+  overwrite without `--force`, progress with rows/s, verification summary
 
 ## Tests
 
 ```bash
 python3 tests/test_conversion.py
 ```
-
-Generates synthetic fixtures (inline-string dump with sparse cells; multi-sheet
-workbook with sharedStrings, date serials and booleans) and asserts row counts,
-NULL placement, date conversion, and identifier sanitization.
 
 ## License
 
