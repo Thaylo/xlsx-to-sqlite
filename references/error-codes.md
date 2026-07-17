@@ -20,6 +20,8 @@ differs, so you can split afterwards instead of shipping a garbage table.
 | E03 | Not enough free disk (output ≈ uncompressed XML size × 1.2) | Free disk space first. `--ignore-space` overrides only when you know better (e.g. output on another volume). |
 | E04 | Output file already exists | Pick another `-o` path, or `--force` to overwrite deliberately. |
 | E05 | Sheet has no rows (reported as WARN; sheet skipped, run continues) | Nothing to do — but if you expected data, check you're looking at the right sheet. |
+| E06 | URL input, but the server doesn't honor HTTP Range requests (or dropped them mid-run after retries) | Streaming needs random access. Download the file fully (curl/wget/browser), then convert the local copy. Transient network errors are already retried 5x with backoff per 8 MB block before this fires. |
+| E07 | Google Drive link could not be resolved to a direct download | The file is private (check the share settings — "anyone with the link" is required), quota-exhausted, or a native Google Sheet rather than an uploaded .xlsx. Download it manually via the browser, then convert the local copy. |
 
 ## Warnings (conversion completed — inspect before trusting)
 

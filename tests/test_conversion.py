@@ -5,11 +5,15 @@ Builds two synthetic workbooks exercising the format traps that corrupt data
 silently (sparse cells, date serials, sharedStrings, dirty headers), converts
 them, and asserts on the resulting databases.
 """
+import http.server
+import importlib.util
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import zipfile
 from datetime import date, timedelta
 
@@ -216,10 +220,99 @@ def test_title_row_diagnostic(tmp):
     print("PASS title-row diagnostic (W07) + --header-row recovery")
 
 
+class _RangeHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal HTTP server honoring Range requests (like real file hosts)."""
+    payload = b""
+
+    def do_GET(self):
+        data = self.payload
+        m = re.match(r"bytes=(\d+)-(\d*)$", self.headers.get("Range") or "")
+        if m:
+            start = int(m.group(1))
+            end = min(int(m.group(2)) if m.group(2) else len(data) - 1, len(data) - 1)
+            chunk = data[start:end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+        else:
+            chunk = data
+            self.send_response(200)
+        self.send_header("Content-Length", str(len(chunk)))
+        self.end_headers()
+        self.wfile.write(chunk)
+
+    def log_message(self, *a):
+        pass
+
+
+class _NoRangeHandler(_RangeHandler):
+    """Server that ignores Range — must be rejected with E06, not half-read."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(self.payload)))
+        self.end_headers()
+        self.wfile.write(self.payload)
+
+
+def _serve(handler, payload):
+    handler.payload = payload
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}/file.xlsx"
+
+
+def _small_orders_xlsx(tmp, n=300):
+    rows = [_cells(1, ["ID", "Name", "Val"])]
+    rows += [_cells(i, [f"a{i}", f"n{i}", f"v{i}"]) for i in range(2, n + 2)]
+    path = os.path.join(tmp, "remote_src.xlsx")
+    write_xlsx(path, ["Orders"], [sheet(rows)])
+    return path, n
+
+
+def test_remote_streaming(tmp):
+    """Convert straight from a URL: ranged download + conversion in one pass."""
+    path, n = _small_orders_xlsx(tmp)
+    payload = open(path, "rb").read()
+    srv, url = _serve(_RangeHandler, payload)
+    try:
+        conn, log = convert(url, os.path.join(tmp, "remote.sqlite"))
+        assert "remote input:" in log and "network:" in log, log
+        assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == n
+
+        # multi-block path: tiny blocks force many ranged GETs + LRU eviction
+        spec = importlib.util.spec_from_file_location("x2s", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        hf = mod.HttpFile(url, block_size=1024, cache_blocks=3)
+        with zipfile.ZipFile(hf) as zremote, zipfile.ZipFile(path) as zlocal:
+            assert zremote.namelist() == zlocal.namelist()
+            member = "xl/worksheets/sheet1.xml"
+            assert zremote.read(member) == zlocal.read(member)
+        assert hf.fetched > 5 * 1024, hf.fetched  # really came in many pieces
+    finally:
+        srv.shutdown()
+    print("PASS remote streaming (ranged download -> sqlite, multi-block)")
+
+
+def test_remote_no_range_support(tmp):
+    """A server without Range support must fail fast with E06."""
+    path, _ = _small_orders_xlsx(tmp)
+    srv, url = _serve(_NoRangeHandler, open(path, "rb").read())
+    try:
+        r = subprocess.run([sys.executable, SCRIPT, url, "-o",
+                            os.path.join(tmp, "never.sqlite")],
+                           capture_output=True, text=True)
+        assert r.returncode != 0 and "[E06]" in (r.stdout + r.stderr), r.stderr
+    finally:
+        srv.shutdown()
+    print("PASS E06 on servers without range support")
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         test_inline_sparse_dirty_headers(tmp)
         test_sharedstrings_dates_bools(tmp)
         test_stacked_tables_diagnostics(tmp)
         test_title_row_diagnostic(tmp)
+        test_remote_streaming(tmp)
+        test_remote_no_range_support(tmp)
     print("ALL TESTS PASS")

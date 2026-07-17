@@ -48,7 +48,19 @@ questions that decide the flags you'll pass:
 ```bash
 python3 scripts/xlsx_to_sqlite.py file.xlsx            # all sheets -> file.sqlite
 python3 scripts/xlsx_to_sqlite.py file.xlsx -o out.sqlite --sheet "Vendas 2024"
+python3 scripts/xlsx_to_sqlite.py "https://…/big.xlsx" -o out.sqlite   # remote
 ```
+
+**Remote files convert while downloading.** Pass an http(s) URL (Google
+Drive/Docs share links are auto-resolved, including the big-file virus-scan
+confirmation) and the converter streams it with HTTP Range requests: the .xlsx
+never touches local disk — only the SQLite output does — so a 2 GB export
+needs ~2 GB of disk, not ~4. Each 8 MB block is an independent request retried
+with backoff, so flaky connections cost one block, not the whole download.
+`--peek` on a URL is nearly free (a few MB), so still peek first. Total bytes
+transferred ≈ file size — the wins are disk, overlap, and retry granularity,
+not bandwidth. Servers without Range support fail fast as `E06`; private
+Drive files as `E07` (download those manually, then convert the local copy).
 
 The script needs only the Python standard library — never install pandas or
 openpyxl for this task; a 2 GB file would take 30+ minutes and gigabytes of RAM

@@ -29,6 +29,10 @@ cd xlsx-to-sqlite
 python3 scripts/xlsx_to_sqlite.py dump.xlsx --peek   # inspect sheets + first rows
 python3 scripts/xlsx_to_sqlite.py dump.xlsx          # convert -> dump.sqlite
 python3 scripts/xlsx_to_sqlite.py dump.xlsx --sheet "Sales" -o sales.sqlite
+
+# remote files convert WHILE downloading (HTTP Range streaming) — the .xlsx
+# never touches your disk; Google Drive share links are auto-resolved:
+python3 scripts/xlsx_to_sqlite.py "https://drive.google.com/file/d/FILE_ID/view" -o data.sqlite
 ```
 
 Then query with the `sqlite3` CLI or any GUI (e.g.

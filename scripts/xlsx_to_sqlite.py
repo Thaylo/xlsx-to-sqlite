@@ -17,6 +17,7 @@ artifacts) are reported as `WARN [Wnn]` lines and hard failures as
 references/error-codes.md.
 """
 import argparse
+import io
 import os
 import posixpath
 import re
@@ -25,9 +26,11 @@ import sqlite3
 import sys
 import time
 import unicodedata
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
 
 NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
@@ -39,6 +42,131 @@ BUILTIN_DATE_FMTS = (
 )
 SNIFF_ROWS = 2000
 GAP_ROWS = 3  # this many consecutive blank rows inside data smells like stacked tables
+
+
+# ---------- remote input: convert while downloading ----------
+
+UA = "Mozilla/5.0 (xlsx-to-sqlite)"
+
+
+class HttpFile(io.RawIOBase):
+    """Seekable read-only view of a remote file via HTTP Range requests.
+
+    Handing this to zipfile means the xlsx is converted WHILE it downloads:
+    the XML parser pulls bytes on demand, each 8 MB block is one independent
+    ranged GET (retried with backoff on network hiccups), and the .xlsx never
+    touches the local disk — only the SQLite output does. Total transfer is
+    still ~the file size; the wins are disk, latency overlap, and retries.
+    """
+
+    def __init__(self, url, block_size=8 * 1024 * 1024, cache_blocks=6, retries=5):
+        self.url = url
+        self.block_size = block_size
+        self.cache_blocks = cache_blocks
+        self.retries = retries
+        self.pos = 0
+        self.cache, self.order = {}, []
+        self.fetched = 0
+        self.size = self._probe_size()
+
+    def _probe_size(self):
+        req = urllib.request.Request(self.url, headers={"Range": "bytes=0-0", "User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            if r.status == 206:
+                m = re.match(r"bytes 0-0/(\d+)", r.headers.get("Content-Range", ""))
+                if m:
+                    return int(m.group(1))
+            raise OSError("ERROR [E06] the server does not support HTTP range "
+                          "requests; download the file fully, then convert the "
+                          "local copy")
+
+    def _fetch_range(self, start, end):
+        last = None
+        for attempt in range(self.retries):
+            try:
+                req = urllib.request.Request(
+                    self.url, headers={"Range": f"bytes={start}-{end}", "User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    if r.status != 206:
+                        raise OSError("ERROR [E06] server stopped honoring range requests")
+                    data = r.read()
+                self.fetched += len(data)
+                return data
+            except OSError as e:
+                last = e
+                time.sleep(min(2 ** attempt, 30))
+        raise OSError(f"ERROR [E06] range request failed after {self.retries} "
+                      f"attempts: {last}")
+
+    def _block(self, bi):
+        if bi in self.cache:
+            return self.cache[bi]
+        start = bi * self.block_size
+        data = self._fetch_range(start, min(start + self.block_size, self.size) - 1)
+        self.cache[bi] = data
+        self.order.append(bi)
+        if len(self.order) > self.cache_blocks:
+            self.cache.pop(self.order.pop(0), None)
+        return data
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = self.size - self.pos
+        size = max(0, min(size, self.size - self.pos))
+        out = bytearray()
+        while size > 0:
+            bi, off = divmod(self.pos, self.block_size)
+            chunk = self._block(bi)[off:off + size]
+            if not chunk:
+                break
+            out += chunk
+            self.pos += len(chunk)
+            size -= len(chunk)
+        return bytes(out)
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_SET:
+            self.pos = offset
+        elif whence == io.SEEK_CUR:
+            self.pos += offset
+        else:
+            self.pos = self.size + offset
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+
+def resolve_gdrive(url):
+    """Turn a Google Drive/Docs share link into a direct download URL,
+    passing the 'can't scan for viruses' confirmation page big files get."""
+    if not re.search(r"(drive|docs)\.google\.com", url):
+        return url
+    m = re.search(r"(?:/d/|[?&]id=)([A-Za-z0-9_-]{20,})", url)
+    if not m:
+        return url
+    direct = f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    req = urllib.request.Request(direct, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            if "text/html" not in r.headers.get("Content-Type", ""):
+                return direct
+            page = r.read(262144).decode("utf-8", "replace")
+    except OSError as e:
+        raise OSError(f"ERROR [E07] Google Drive resolution failed: {e}")
+    action = re.search(r'action="([^"]+)"', page)
+    fields = re.findall(r'name="([^"]+)" value="([^"]*)"', page)
+    if not action or not fields:
+        raise OSError("ERROR [E07] Google Drive did not offer a direct download "
+                      "— the file may be private (open the share link in a "
+                      "browser and check permissions) or quota-limited")
+    return action.group(1) + "?" + urlencode(dict(fields))
 
 
 # ---------- workbook metadata ----------
@@ -415,7 +543,9 @@ def peek(zf, sheets, shared, date_styles, epoch, n):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("xlsx")
+    p.add_argument("xlsx", help="path to a .xlsx file, or an http(s):// URL "
+                                "(Google Drive share links are auto-resolved); "
+                                "URLs stream-convert while downloading")
     p.add_argument("-o", "--output")
     p.add_argument("--sheet", action="append", help="convert only this sheet (repeatable)")
     p.add_argument("--peek", action="store_true", help="print sheets + first rows, no conversion")
@@ -428,14 +558,25 @@ def main():
     p.add_argument("--ignore-space", action="store_true", help="skip the free-disk check")
     opts = p.parse_args()
 
+    remote = None
     try:
-        zf = zipfile.ZipFile(opts.xlsx)
+        if re.match(r"^https?://", opts.xlsx):
+            url = resolve_gdrive(opts.xlsx)
+            remote = HttpFile(url)
+            print(f"remote input: {remote.size / 1e9:.2f} GB — streaming via "
+                  "ranged requests, converting while downloading", flush=True)
+            zf = zipfile.ZipFile(remote)
+        else:
+            zf = zipfile.ZipFile(opts.xlsx)
         sheets = discover_sheets(zf)
     except FileNotFoundError:
         sys.exit(f"ERROR [E01] {opts.xlsx}: file not found")
     except (zipfile.BadZipFile, KeyError, ET.ParseError) as e:
         sys.exit(f"ERROR [E01] {opts.xlsx}: not a readable .xlsx ({e!r}); .xls/.xlsb "
                  "need conversion first — see references/error-codes.md")
+    except OSError as e:
+        msg = str(e)
+        sys.exit(msg if "[E0" in msg else f"ERROR [E06] cannot stream from URL: {e}")
     if opts.sheet:
         wanted = set(opts.sheet)
         sheets = [s for s in sheets if s[0] in wanted]
@@ -452,6 +593,8 @@ def main():
         peek(zf, sheets, shared, date_styles, epoch, 5)
         return
 
+    if remote and not opts.output:
+        p.error("-o/--output is required when the input is a URL")
     out = opts.output or os.path.splitext(opts.xlsx)[0] + ".sqlite"
     if os.path.exists(out) and not opts.force:
         sys.exit(f"ERROR [E04] refusing to overwrite {out} (use --force)")
@@ -486,6 +629,9 @@ def main():
         print(f"  {table}: {count:,} rows, columns: {headers}")
         for row in conn.execute(f'SELECT * FROM "{table}" LIMIT {opts.sample}'):
             print("    " + " | ".join(str(v)[:60] for v in row))
+    if remote:
+        print(f"network: {remote.fetched / 1e9:.2f} GB fetched via ranged requests "
+              "(no local .xlsx copy was written)")
     if diagnostics:
         print(f"diagnostics: {len(diagnostics)} warning(s) — codes explained in "
               "references/error-codes.md")
