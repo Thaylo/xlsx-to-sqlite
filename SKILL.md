@@ -101,6 +101,16 @@ re-creates the original problem.
 
 ## When something looks wrong
 
+The converter emits stable diagnostic codes — `WARN [W01..W07]` for structural
+anomalies (it still completes) and `ERROR [E01..E05]` for hard failures. Treat
+any WARN as a to-do, not noise: the most common cause is a sheet holding
+several logical tables (stacked blocks, per-block headers, side-by-side
+ranges, title rows), which converts *physically* fine into one table that is
+*logically* wrong. Read `references/error-codes.md` for the full code table
+with a recovery playbook per code (splitting blocks with SQL, `--header-row`,
+`--no-header` raw imports, dropping artifact columns) — and relay the code to
+the user when reporting.
+
 Read `references/xlsx-internals.md` for the file-format details (cell types,
 date serials, sharedStrings, namespaces) before hand-rolling any fix — most
 "corrupt" files are just a quirk the reference explains. Non-.xlsx inputs are

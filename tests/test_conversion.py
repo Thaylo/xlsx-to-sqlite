@@ -77,11 +77,11 @@ def sheet(rows):
             f'<sheetData>{"".join(rows)}</sheetData></worksheet>')
 
 
-def convert(xlsx, out):
-    r = subprocess.run([sys.executable, SCRIPT, xlsx, "-o", out, "--force"],
+def convert(xlsx, out, *extra):
+    r = subprocess.run([sys.executable, SCRIPT, xlsx, "-o", out, "--force", *extra],
                        capture_output=True, text=True)
     assert r.returncode == 0, f"converter failed:\n{r.stdout}\n{r.stderr}"
-    return sqlite3.connect(out)
+    return sqlite3.connect(out), r.stdout
 
 
 def test_inline_sparse_dirty_headers(tmp):
@@ -101,7 +101,8 @@ def test_inline_sparse_dirty_headers(tmp):
         rows.append(f'<row r="{r}">' + "".join(cells) + "</row>")
     xlsx = os.path.join(tmp, "orders.xlsx")
     write_xlsx(xlsx, ["Orders"], [sheet(rows)])
-    conn = convert(xlsx, os.path.join(tmp, "orders.sqlite"))
+    conn, log = convert(xlsx, os.path.join(tmp, "orders.sqlite"))
+    assert "diagnostics: clean" in log, log
 
     cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)")]
     assert cols == ["order_id", "product", "qty", "unit_price", "resume_notes"], cols
@@ -156,7 +157,7 @@ def test_sharedstrings_dates_bools(tmp):
     xlsx = os.path.join(tmp, "crm.xlsx")
     write_xlsx(xlsx, ["Contacts 2024", "Companies"], [sheet(rows1), sheet(rows2)],
                shared_xml=sst, styles_xml=styles)
-    conn = convert(xlsx, os.path.join(tmp, "crm.sqlite"))
+    conn, _ = convert(xlsx, os.path.join(tmp, "crm.sqlite"))
 
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
@@ -171,8 +172,54 @@ def test_sharedstrings_dates_bools(tmp):
     print("PASS sharedStrings + date serials + booleans + multi-sheet")
 
 
+def _cells(r, values):
+    out = []
+    for j, v in enumerate(values):
+        if v is not None:
+            out.append(f'<c r="{chr(65+j)}{r}" t="inlineStr"><is><t>{v}</t></is></c>')
+    return f'<row r="{r}">' + "".join(out) + "</row>"
+
+
+def test_stacked_tables_diagnostics(tmp):
+    """Two blocks with repeated headers separated by blank rows -> W01 + W02."""
+    rows = [_cells(1, ["ID", "Name", "Val"])]
+    for i in range(2, 22):
+        rows.append(_cells(i, [f"a{i}", f"n{i}", f"v{i}"]))
+    rows.append(_cells(30, ["ID", "Name", "Val"]))  # second block, rows 22-29 blank
+    for i in range(31, 41):
+        rows.append(_cells(i, [f"b{i}", f"m{i}", f"w{i}"]))
+    xlsx = os.path.join(tmp, "stacked.xlsx")
+    write_xlsx(xlsx, ["Report"], [sheet(rows)])
+    conn, log = convert(xlsx, os.path.join(tmp, "stacked.sqlite"))
+    assert "[W01]" in log, log     # blank gap detected
+    assert "[W02]" in log, log     # repeated header detected
+    n = conn.execute("SELECT COUNT(*) FROM report").fetchone()[0]
+    assert n == 31, n              # 20 + repeated header + 10, nothing lost
+    print("PASS stacked-tables diagnostics (W01 + W02)")
+
+
+def test_title_row_diagnostic(tmp):
+    """A one-cell title above the real header -> W07; --header-row 2 fixes it."""
+    rows = [_cells(1, ["Quarterly Report 2024"]),
+            _cells(2, ["ID", "Name", "Val"])]
+    for i in range(3, 13):
+        rows.append(_cells(i, [f"a{i}", f"n{i}", f"v{i}"]))
+    xlsx = os.path.join(tmp, "titled.xlsx")
+    write_xlsx(xlsx, ["Summary"], [sheet(rows)])
+    _, log = convert(xlsx, os.path.join(tmp, "titled_bad.sqlite"))
+    assert "[W07]" in log and "--header-row 2" in log, log
+    conn, log2 = convert(xlsx, os.path.join(tmp, "titled_ok.sqlite"), "--header-row", "2")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(summary)")]
+    assert cols == ["id", "name", "val"], cols
+    assert conn.execute("SELECT COUNT(*) FROM summary").fetchone()[0] == 10
+    assert "diagnostics: clean" in log2, log2
+    print("PASS title-row diagnostic (W07) + --header-row recovery")
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         test_inline_sparse_dirty_headers(tmp)
         test_sharedstrings_dates_bools(tmp)
+        test_stacked_tables_diagnostics(tmp)
+        test_title_row_diagnostic(tmp)
     print("ALL TESTS PASS")

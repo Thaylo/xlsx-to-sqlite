@@ -10,6 +10,11 @@ Why streaming: a .xlsx is a zip of XML; the worksheet XML is often 3-10x the
 file size once decompressed. Loading it whole (pandas/openpyxl default mode)
 needs RAM proportional to that. This script parses the XML as a stream and
 inserts in batches, so memory stays flat regardless of file size.
+
+Diagnostics: structural anomalies (stacked tables, repeated headers, layout
+artifacts) are reported as `WARN [Wnn]` lines and hard failures as
+`ERROR [Enn]` — the code table with recovery playbooks lives in
+references/error-codes.md.
 """
 import argparse
 import os
@@ -33,6 +38,7 @@ BUILTIN_DATE_FMTS = (
     set(range(14, 23)) | set(range(27, 37)) | set(range(45, 48)) | set(range(50, 59))
 )
 SNIFF_ROWS = 2000
+GAP_ROWS = 3  # this many consecutive blank rows inside data smells like stacked tables
 
 
 # ---------- workbook metadata ----------
@@ -170,18 +176,23 @@ def cell_value(c, shared, date_styles, epoch):
     return num
 
 
-def iter_rows(zf, member, shared, date_styles, epoch):
-    """Yield dict {col_index: value} per row, streaming. Never trust cell
-    order alone: sparse rows omit empty cells, so positions come from r=."""
+def iter_rows(zf, member, shared, date_styles, epoch, meta=None):
+    """Yield (row_number, {col_index: value}) per row, streaming. Never trust
+    cell order alone: sparse rows omit empty cells, so positions come from r=."""
     with zf.open(member) as stream:
-        root = None
+        root, rownum = None, 0
         for event, elem in ET.iterparse(stream, events=("start", "end")):
             if event == "start":
                 if root is None:
                     root = elem
                 continue
+            if elem.tag == NS + "dimension" and meta is not None:
+                meta["dimension"] = elem.get("ref", "")
+                continue
             if elem.tag != NS + "row":
                 continue
+            r = elem.get("r")
+            rownum = int(r) if r and r.isdigit() else rownum + 1
             cells, last = {}, -1
             for c in elem.iter(NS + "c"):
                 ref = c.get("r")
@@ -190,7 +201,7 @@ def iter_rows(zf, member, shared, date_styles, epoch):
                 val = cell_value(c, shared, date_styles, epoch)
                 if val is not None:
                     cells[idx] = val
-            yield cells
+            yield rownum, cells
             elem.clear()
             root.clear()
 
@@ -211,7 +222,7 @@ def sanitize(name, i, seen):
 
 def sniff_types(rows, ncols):
     kinds = [set() for _ in range(ncols)]
-    for row in rows:
+    for _, row in rows:
         for i, v in row.items():
             if i < ncols and v is not None:
                 kinds[i].add(float if isinstance(v, float) else type(v))
@@ -228,39 +239,63 @@ def sniff_types(rows, ncols):
 
 # ---------- conversion ----------
 
-def convert_sheet(conn, zf, sheet_name, member, shared, date_styles, epoch, opts, taken_tables):
+def convert_sheet(conn, zf, sheet_name, member, shared, date_styles, epoch, opts,
+                  taken_tables, diagnostics):
     table = sanitize(sheet_name, 0, taken_tables)
-    rows = iter_rows(zf, member, shared, date_styles, epoch)
+    meta = {}
+    rows = iter_rows(zf, member, shared, date_styles, epoch, meta)
 
-    headers, buffer, skipped_before_header = None, [], 0
-    target_header_row = opts.header_row  # 1-based count of non-XML-empty rows
-    seen_rows = 0
-    for cells in rows:
+    def diag(code, msg):
+        line = f"WARN [{code}] sheet '{sheet_name}': {msg}"
+        diagnostics.append(line)
+        print("  " + line, flush=True)
+
+    headers_src, buffer = None, []
+    skipped_before_header = seen_rows = header_rownum = 0
+    for rownum, cells in rows:
         if not cells:
             continue
         seen_rows += 1
         if opts.no_header:
             headers_src = {}
-            buffer.append(cells)
+            buffer.append((rownum, cells))
             break
-        if seen_rows < target_header_row:
+        if seen_rows < opts.header_row:
             skipped_before_header += 1
             continue
         headers_src = cells
+        header_rownum = rownum
         break
     else:
-        print(f"  sheet '{sheet_name}': empty, skipped", flush=True)
+        print(f"  WARN [E05] sheet '{sheet_name}': no rows, skipped", flush=True)
         return None
 
     # buffer a sniff window to size the table and pick column affinities
-    for cells in rows:
-        buffer.append(cells)
+    for rc in rows:
+        buffer.append(rc)
         if len(buffer) >= SNIFF_ROWS:
             break
     width = max(
-        [max(headers_src, default=-1) + 1 if headers_src else 0]
-        + [max(b, default=-1) + 1 for b in buffer]
+        ([max(headers_src, default=-1) + 1] if headers_src else [0])
+        + [max(c, default=-1) + 1 for _, c in buffer]
     )
+
+    # --- structural sanity checks on the header (codes: references/error-codes.md)
+    if headers_src and not opts.no_header:
+        span = max(headers_src) - min(headers_src) + 1
+        if len(headers_src) < span:
+            diag("W04", f"header row {header_rownum} has {span - len(headers_src)} "
+                        "gap(s) inside it — merged cells or title layout; the gap "
+                        "columns got col_N names")
+        if opts.header_row == 1 and len(headers_src) == 1 and buffer:
+            avg = sum(len(c) for _, c in buffer[:5]) / len(buffer[:5])
+            if avg >= 3:
+                only = next(iter(headers_src.values()))
+                diag("W07", f"first non-empty row has a single cell "
+                            f"({str(only)[:40]!r}) but data rows have ~{avg:.0f} "
+                            "cells — likely a title above the real header; "
+                            "re-run with --header-row 2 (check with --peek)")
+
     seen_cols = set()
     if opts.no_header:
         headers = [sanitize(None, i, seen_cols) for i in range(width)]
@@ -272,6 +307,22 @@ def convert_sheet(conn, zf, sheet_name, member, shared, date_styles, epoch, opts
     insert = f'INSERT INTO "{table}" VALUES ({",".join("?" * width)})'
 
     t0, total, batch, last_report = time.time(), 0, [], time.time()
+    counts = {}          # per-column non-null tally, for W05
+    gaps, repeats = [], []
+    scan_last = header_rownum or None
+    header_sig = (frozenset(headers_src.values()) or None) if headers_src else None
+    first_hkey = min(headers_src) if headers_src else None
+
+    def scan(rownum, cells):
+        """Track stacked-table smells: blank-row gaps and repeated header rows."""
+        nonlocal scan_last
+        if scan_last is not None and rownum - scan_last > GAP_ROWS and len(gaps) < 10:
+            gaps.append((scan_last, rownum))
+        scan_last = rownum
+        if (header_sig and cells.get(first_hkey) == headers_src[first_hkey]
+                and len(cells) == len(headers_src)
+                and frozenset(cells.values()) == header_sig and len(repeats) < 10):
+            repeats.append(rownum)
 
     def flush():
         nonlocal total
@@ -283,16 +334,22 @@ def convert_sheet(conn, zf, sheet_name, member, shared, date_styles, epoch, opts
 
     def widen(new_width):
         nonlocal width, insert
+        diag("W03", f"data extends beyond the header ({width} -> {new_width} "
+                    "columns) — extra col_N columns added; side-by-side table "
+                    "or stray cells right of the range?")
         for i in range(width, new_width):
             headers.append(sanitize(None, i, seen_cols))
             conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{headers[i]}"')
         width = new_width
         insert = f'INSERT INTO "{table}" VALUES ({",".join("?" * width)})'
 
-    def push(cells):
+    def push(rownum, cells):
         nonlocal last_report
         if not cells:
             return
+        scan(rownum, cells)
+        for i in cells:
+            counts[i] = counts.get(i, 0) + 1
         if max(cells) >= width:
             flush()
             widen(max(cells) + 1)
@@ -304,11 +361,32 @@ def convert_sheet(conn, zf, sheet_name, member, shared, date_styles, epoch, opts
                 print(f"  {table}: {total:,} rows  {el:.0f}s  ({total / el:,.0f} rows/s)", flush=True)
                 last_report = time.time()
 
-    for cells in buffer:
-        push(cells)
-    for cells in rows:
-        push(cells)
+    for rownum, cells in buffer:
+        push(rownum, cells)
+    for rownum, cells in rows:
+        push(rownum, cells)
     flush()
+
+    # --- post-load structural diagnostics
+    if gaps:
+        shown = ", ".join(f"{a}->{b}" for a, b in gaps[:3])
+        diag("W01", f"{len(gaps)} blank gap(s) of >{GAP_ROWS} rows inside the data "
+                    f"(e.g. rows {shown}) — the sheet may contain stacked tables")
+    if repeats:
+        diag("W02", f"the header row repeats at row(s) {repeats} — stacked tables "
+                    "with per-block headers; those rows were imported as data")
+    if total >= 1000:
+        hollow = [headers[i] for i in range(width) if counts.get(i, 0) < total * 0.01]
+        if hollow:
+            diag("W05", f"column(s) {hollow} are >99% empty — layout artifacts? "
+                        "consider dropping them")
+    m = re.search(r":[A-Z]+(\d+)$", meta.get("dimension", ""))
+    if m:
+        declared = int(m.group(1)) - (header_rownum or 0)
+        if declared > 0 and abs(declared - total) > max(2, declared * 0.01):
+            diag("W06", f"sheet dimension declares ~{declared:,} data rows but "
+                        f"{total:,} were imported — trailing blanks or a lying "
+                        "dimension; trust the imported count, cross-check the source")
 
     dbcount = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
     status = "OK" if dbcount == total else f"MISMATCH inserted={total}"
@@ -322,13 +400,17 @@ def convert_sheet(conn, zf, sheet_name, member, shared, date_styles, epoch, opts
 def peek(zf, sheets, shared, date_styles, epoch, n):
     for name, member in sheets:
         size = zf.getinfo(member).file_size
+        meta, shown = {}, 0
         print(f"\n=== sheet '{name}' ({size / 1e6:,.0f} MB uncompressed XML)")
-        for i, cells in enumerate(iter_rows(zf, member, shared, date_styles, epoch)):
-            if i >= n:
+        for rownum, cells in iter_rows(zf, member, shared, date_styles, epoch, meta):
+            if shown >= n:
                 break
+            shown += 1
             width = max(cells, default=-1) + 1
             vals = [str(cells.get(j, ""))[:28] for j in range(min(width, 12))]
-            print(f"  row{i + 1}: {vals}{' …' if width > 12 else ''}")
+            print(f"  row {rownum}: {vals}{' …' if width > 12 else ''}")
+        if meta.get("dimension"):
+            print(f"  dimension: {meta['dimension']}")
 
 
 def main():
@@ -346,14 +428,20 @@ def main():
     p.add_argument("--ignore-space", action="store_true", help="skip the free-disk check")
     opts = p.parse_args()
 
-    zf = zipfile.ZipFile(opts.xlsx)
-    sheets = discover_sheets(zf)
+    try:
+        zf = zipfile.ZipFile(opts.xlsx)
+        sheets = discover_sheets(zf)
+    except FileNotFoundError:
+        sys.exit(f"ERROR [E01] {opts.xlsx}: file not found")
+    except (zipfile.BadZipFile, KeyError, ET.ParseError) as e:
+        sys.exit(f"ERROR [E01] {opts.xlsx}: not a readable .xlsx ({e!r}); .xls/.xlsb "
+                 "need conversion first — see references/error-codes.md")
     if opts.sheet:
         wanted = set(opts.sheet)
         sheets = [s for s in sheets if s[0] in wanted]
         missing = wanted - {s[0] for s in sheets}
         if missing:
-            sys.exit(f"sheet(s) not found: {sorted(missing)}; available: "
+            sys.exit(f"ERROR [E02] sheet(s) not found: {sorted(missing)}; available: "
                      f"{[s[0] for s in discover_sheets(zf)]}")
 
     epoch = datetime(1904, 1, 1) if uses_1904_epoch(zf) else datetime(1899, 12, 30)
@@ -366,7 +454,7 @@ def main():
 
     out = opts.output or os.path.splitext(opts.xlsx)[0] + ".sqlite"
     if os.path.exists(out) and not opts.force:
-        sys.exit(f"refusing to overwrite {out} (use --force)")
+        sys.exit(f"ERROR [E04] refusing to overwrite {out} (use --force)")
 
     # The DB lands roughly the size of the uncompressed XML. Check before
     # writing gigabytes: running a disk to 0 mid-conversion hurts.
@@ -376,7 +464,7 @@ def main():
     free = shutil.disk_usage(os.path.dirname(os.path.abspath(out))).free
     print(f"estimated output ~{est / 1e9:.1f} GB, free disk {free / 1e9:.1f} GB")
     if not opts.ignore_space and free < est * 1.2 + 2e8:
-        sys.exit("not enough free disk for a safe conversion "
+        sys.exit("ERROR [E03] not enough free disk for a safe conversion "
                  "(need ~1.2x the uncompressed sheet size); free space or use --ignore-space")
 
     if os.path.exists(out):
@@ -385,9 +473,10 @@ def main():
     conn.executescript(
         "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;"
     )
-    results, taken = [], set()
+    results, taken, diagnostics = [], set(), []
     for name, member in sheets:
-        r = convert_sheet(conn, zf, name, member, shared, date_styles, epoch, opts, taken)
+        r = convert_sheet(conn, zf, name, member, shared, date_styles, epoch, opts,
+                          taken, diagnostics)
         if r:
             results.append(r)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -397,6 +486,11 @@ def main():
         print(f"  {table}: {count:,} rows, columns: {headers}")
         for row in conn.execute(f'SELECT * FROM "{table}" LIMIT {opts.sample}'):
             print("    " + " | ".join(str(v)[:60] for v in row))
+    if diagnostics:
+        print(f"diagnostics: {len(diagnostics)} warning(s) — codes explained in "
+              "references/error-codes.md")
+    else:
+        print("diagnostics: clean")
     conn.close()
 
 

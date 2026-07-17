@@ -70,6 +70,9 @@ documents the file-format traps for when a file misbehaves.
   wider than the header, phonetic (furigana) runs
 - free-disk check before writing (output ≈ 10x the .xlsx size), refusal to
   overwrite without `--force`, progress with rows/s, verification summary
+- structural diagnostics with stable codes — stacked tables in one sheet,
+  repeated headers, title rows, layout artifacts — each with a recovery
+  playbook in [references/error-codes.md](references/error-codes.md)
 
 ## Tests
 
