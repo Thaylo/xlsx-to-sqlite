@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Stream large .xlsx files into SQLite with flat memory. Stdlib only.
+
+Usage:
+  python3 xlsx_to_sqlite.py input.xlsx                 # convert all sheets
+  python3 xlsx_to_sqlite.py input.xlsx --peek          # inspect before converting
+  python3 xlsx_to_sqlite.py input.xlsx -o out.sqlite --sheet "Sales 2024"
+
+Why streaming: a .xlsx is a zip of XML; the worksheet XML is often 3-10x the
+file size once decompressed. Loading it whole (pandas/openpyxl default mode)
+needs RAM proportional to that. This script parses the XML as a stream and
+inserts in batches, so memory stays flat regardless of file size.
+"""
+import argparse
+import os
+import posixpath
+import re
+import shutil
+import sqlite3
+import sys
+import time
+import unicodedata
+import xml.etree.ElementTree as ET
+import zipfile
+from datetime import datetime, timedelta
+
+NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+PNS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+# Built-in Excel number-format ids that render as dates/times.
+BUILTIN_DATE_FMTS = (
+    set(range(14, 23)) | set(range(27, 37)) | set(range(45, 48)) | set(range(50, 59))
+)
+SNIFF_ROWS = 2000
+
+
+# ---------- workbook metadata ----------
+
+def discover_sheets(zf):
+    """Return [(sheet_name, zip_member_path)] in workbook order."""
+    rels = {}
+    with zf.open("xl/_rels/workbook.xml.rels") as f:
+        for rel in ET.parse(f).getroot():
+            target = rel.get("Target", "").lstrip("/")
+            if not target.startswith("xl/"):
+                target = posixpath.normpath(posixpath.join("xl", target))
+            rels[rel.get("Id")] = target
+    sheets = []
+    with zf.open("xl/workbook.xml") as f:
+        root = ET.parse(f).getroot()
+        for sh in root.iter(NS + "sheet"):
+            rid = sh.get(RNS + "id")
+            if rid in rels:
+                sheets.append((sh.get("name"), rels[rid]))
+    return sheets
+
+
+def uses_1904_epoch(zf):
+    with zf.open("xl/workbook.xml") as f:
+        pr = ET.parse(f).getroot().find(NS + "workbookPr")
+    return pr is not None and pr.get("date1904") in ("1", "true")
+
+
+def load_shared_strings(zf):
+    """sharedStrings.xml holds every distinct string; cells reference by index."""
+    if "xl/sharedStrings.xml" not in zf.namelist():
+        return []
+    strings, root = [], None
+    with zf.open("xl/sharedStrings.xml") as f:
+        for event, si in ET.iterparse(f, events=("start", "end")):
+            if event == "start":
+                if root is None:
+                    root = si
+                continue
+            if si.tag != NS + "si":
+                continue
+            # drop phonetic (furigana) runs so they don't pollute the text
+            for junk in si.findall(NS + "rPh") + si.findall(NS + "phoneticPr"):
+                si.remove(junk)
+            strings.append("".join(t.text or "" for t in si.iter(NS + "t")))
+            si.clear()
+            if len(strings) % 100_000 == 0:
+                root.clear()
+    return strings
+
+
+def _is_date_code(code):
+    if re.search(r"\[(h+|m+|s+)\]", code, re.I):  # elapsed time like [h]:mm
+        return True
+    stripped = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', "", code)
+    return bool(re.search(r"[dmhys]", stripped, re.I))
+
+
+def load_date_styles(zf):
+    """Set of cell style indexes (the s= attribute) whose format is a date."""
+    if "xl/styles.xml" not in zf.namelist():
+        return set()
+    with zf.open("xl/styles.xml") as f:
+        root = ET.parse(f).getroot()
+    custom = {}
+    for nf in root.iter(NS + "numFmt"):
+        custom[int(nf.get("numFmtId"))] = nf.get("formatCode", "")
+    date_styles = set()
+    cellxfs = root.find(NS + "cellXfs")
+    if cellxfs is None:
+        return date_styles
+    for i, xf in enumerate(cellxfs.findall(NS + "xf")):
+        fmt = int(xf.get("numFmtId", "0"))
+        if fmt in BUILTIN_DATE_FMTS or (fmt in custom and _is_date_code(custom[fmt])):
+            date_styles.add(str(i))
+    return date_styles
+
+
+# ---------- cell decoding ----------
+
+def col_index(ref):
+    idx = 0
+    for ch in ref:
+        if ch.isdigit():
+            break
+        idx = idx * 26 + (ord(ch) - 64)
+    return idx - 1
+
+
+def serial_to_text(num, epoch):
+    """Excel stores dates as day-counts from an epoch; emit ISO 8601 text."""
+    try:
+        days = int(num)
+        secs = round((num - days) * 86400)
+        dt = epoch + timedelta(days=days, seconds=secs)
+    except (OverflowError, ValueError):
+        return num
+    if 0 <= num < 1:
+        return dt.strftime("%H:%M:%S")
+    if dt.hour == dt.minute == dt.second == 0:
+        return dt.strftime("%Y-%m-%d")
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def cell_value(c, shared, date_styles, epoch):
+    t = c.get("t")
+    if t == "s":
+        v = c.find(NS + "v")
+        return shared[int(v.text)] if v is not None and v.text else None
+    if t == "inlineStr":
+        is_el = c.find(NS + "is")
+        if is_el is None:
+            return None
+        for junk in is_el.findall(NS + "rPh") + is_el.findall(NS + "phoneticPr"):
+            is_el.remove(junk)
+        return "".join(node.text or "" for node in is_el.iter(NS + "t")) or None
+    v = c.find(NS + "v")
+    if v is None or v.text is None:
+        return None
+    if t in ("str", "e"):
+        return v.text
+    if t == "b":
+        return int(v.text)
+    s = v.text
+    try:
+        num = int(s)
+    except ValueError:
+        try:
+            num = float(s)
+        except ValueError:
+            return s
+    if c.get("s") in date_styles:
+        return serial_to_text(num, epoch)
+    return num
+
+
+def iter_rows(zf, member, shared, date_styles, epoch):
+    """Yield dict {col_index: value} per row, streaming. Never trust cell
+    order alone: sparse rows omit empty cells, so positions come from r=."""
+    with zf.open(member) as stream:
+        root = None
+        for event, elem in ET.iterparse(stream, events=("start", "end")):
+            if event == "start":
+                if root is None:
+                    root = elem
+                continue
+            if elem.tag != NS + "row":
+                continue
+            cells, last = {}, -1
+            for c in elem.iter(NS + "c"):
+                ref = c.get("r")
+                idx = col_index(ref) if ref else last + 1  # some writers omit r=
+                last = idx
+                val = cell_value(c, shared, date_styles, epoch)
+                if val is not None:
+                    cells[idx] = val
+            yield cells
+            elem.clear()
+            root.clear()
+
+
+# ---------- naming and typing ----------
+
+def sanitize(name, i, seen):
+    s = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode()
+    s = re.sub(r"[^0-9a-zA-Z]+", "_", s).strip("_").lower() or f"col_{i + 1}"
+    if s[0].isdigit():
+        s = "c_" + s
+    base, n = s, 2
+    while s in seen:
+        s, n = f"{base}_{n}", n + 1
+    seen.add(s)
+    return s
+
+
+def sniff_types(rows, ncols):
+    kinds = [set() for _ in range(ncols)]
+    for row in rows:
+        for i, v in row.items():
+            if i < ncols and v is not None:
+                kinds[i].add(float if isinstance(v, float) else type(v))
+    out = []
+    for k in kinds:
+        if str in k or not k:
+            out.append("TEXT")
+        elif float in k:
+            out.append("REAL")
+        else:
+            out.append("INTEGER")
+    return out
+
+
+# ---------- conversion ----------
+
+def convert_sheet(conn, zf, sheet_name, member, shared, date_styles, epoch, opts, taken_tables):
+    table = sanitize(sheet_name, 0, taken_tables)
+    rows = iter_rows(zf, member, shared, date_styles, epoch)
+
+    headers, buffer, skipped_before_header = None, [], 0
+    target_header_row = opts.header_row  # 1-based count of non-XML-empty rows
+    seen_rows = 0
+    for cells in rows:
+        if not cells:
+            continue
+        seen_rows += 1
+        if opts.no_header:
+            headers_src = {}
+            buffer.append(cells)
+            break
+        if seen_rows < target_header_row:
+            skipped_before_header += 1
+            continue
+        headers_src = cells
+        break
+    else:
+        print(f"  sheet '{sheet_name}': empty, skipped", flush=True)
+        return None
+
+    # buffer a sniff window to size the table and pick column affinities
+    for cells in rows:
+        buffer.append(cells)
+        if len(buffer) >= SNIFF_ROWS:
+            break
+    width = max(
+        [max(headers_src, default=-1) + 1 if headers_src else 0]
+        + [max(b, default=-1) + 1 for b in buffer]
+    )
+    seen_cols = set()
+    if opts.no_header:
+        headers = [sanitize(None, i, seen_cols) for i in range(width)]
+    else:
+        headers = [sanitize(headers_src.get(i), i, seen_cols) for i in range(width)]
+    types = sniff_types(buffer, width)
+    cols_sql = ", ".join(f'"{h}" {t}' for h, t in zip(headers, types))
+    conn.execute(f'CREATE TABLE "{table}" ({cols_sql})')
+    insert = f'INSERT INTO "{table}" VALUES ({",".join("?" * width)})'
+
+    t0, total, batch, last_report = time.time(), 0, [], time.time()
+
+    def flush():
+        nonlocal total
+        if batch:
+            conn.executemany(insert, batch)
+            conn.commit()
+            total += len(batch)
+            batch.clear()
+
+    def widen(new_width):
+        nonlocal width, insert
+        for i in range(width, new_width):
+            headers.append(sanitize(None, i, seen_cols))
+            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{headers[i]}"')
+        width = new_width
+        insert = f'INSERT INTO "{table}" VALUES ({",".join("?" * width)})'
+
+    def push(cells):
+        nonlocal last_report
+        if not cells:
+            return
+        if max(cells) >= width:
+            flush()
+            widen(max(cells) + 1)
+        batch.append(tuple(cells.get(i) for i in range(width)))
+        if len(batch) >= opts.batch:
+            flush()
+            if time.time() - last_report > 5:
+                el = time.time() - t0
+                print(f"  {table}: {total:,} rows  {el:.0f}s  ({total / el:,.0f} rows/s)", flush=True)
+                last_report = time.time()
+
+    for cells in buffer:
+        push(cells)
+    for cells in rows:
+        push(cells)
+    flush()
+
+    dbcount = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+    status = "OK" if dbcount == total else f"MISMATCH inserted={total}"
+    print(f"  sheet '{sheet_name}' -> table {table}: {dbcount:,} rows "
+          f"[{status}] in {time.time() - t0:.0f}s", flush=True)
+    if skipped_before_header:
+        print(f"  note: skipped {skipped_before_header} row(s) above the header", flush=True)
+    return table, dbcount, headers
+
+
+def peek(zf, sheets, shared, date_styles, epoch, n):
+    for name, member in sheets:
+        size = zf.getinfo(member).file_size
+        print(f"\n=== sheet '{name}' ({size / 1e6:,.0f} MB uncompressed XML)")
+        for i, cells in enumerate(iter_rows(zf, member, shared, date_styles, epoch)):
+            if i >= n:
+                break
+            width = max(cells, default=-1) + 1
+            vals = [str(cells.get(j, ""))[:28] for j in range(min(width, 12))]
+            print(f"  row{i + 1}: {vals}{' …' if width > 12 else ''}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("xlsx")
+    p.add_argument("-o", "--output")
+    p.add_argument("--sheet", action="append", help="convert only this sheet (repeatable)")
+    p.add_argument("--peek", action="store_true", help="print sheets + first rows, no conversion")
+    p.add_argument("--no-header", action="store_true", help="first row is data; name columns col_N")
+    p.add_argument("--header-row", type=int, default=1,
+                   help="1-based index (among non-empty rows) of the header row; rows above are skipped")
+    p.add_argument("--batch", type=int, default=10_000)
+    p.add_argument("--sample", type=int, default=3, help="sample rows to print per table at the end")
+    p.add_argument("--force", action="store_true", help="overwrite an existing output file")
+    p.add_argument("--ignore-space", action="store_true", help="skip the free-disk check")
+    opts = p.parse_args()
+
+    zf = zipfile.ZipFile(opts.xlsx)
+    sheets = discover_sheets(zf)
+    if opts.sheet:
+        wanted = set(opts.sheet)
+        sheets = [s for s in sheets if s[0] in wanted]
+        missing = wanted - {s[0] for s in sheets}
+        if missing:
+            sys.exit(f"sheet(s) not found: {sorted(missing)}; available: "
+                     f"{[s[0] for s in discover_sheets(zf)]}")
+
+    epoch = datetime(1904, 1, 1) if uses_1904_epoch(zf) else datetime(1899, 12, 30)
+    date_styles = load_date_styles(zf)
+    shared = load_shared_strings(zf)
+
+    if opts.peek:
+        peek(zf, sheets, shared, date_styles, epoch, 5)
+        return
+
+    out = opts.output or os.path.splitext(opts.xlsx)[0] + ".sqlite"
+    if os.path.exists(out) and not opts.force:
+        sys.exit(f"refusing to overwrite {out} (use --force)")
+
+    # The DB lands roughly the size of the uncompressed XML. Check before
+    # writing gigabytes: running a disk to 0 mid-conversion hurts.
+    est = sum(zf.getinfo(m).file_size for _, m in sheets)
+    if "xl/sharedStrings.xml" in zf.namelist():
+        est += 2 * zf.getinfo("xl/sharedStrings.xml").file_size
+    free = shutil.disk_usage(os.path.dirname(os.path.abspath(out))).free
+    print(f"estimated output ~{est / 1e9:.1f} GB, free disk {free / 1e9:.1f} GB")
+    if not opts.ignore_space and free < est * 1.2 + 2e8:
+        sys.exit("not enough free disk for a safe conversion "
+                 "(need ~1.2x the uncompressed sheet size); free space or use --ignore-space")
+
+    if os.path.exists(out):
+        os.remove(out)
+    conn = sqlite3.connect(out)
+    conn.executescript(
+        "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;"
+    )
+    results, taken = [], set()
+    for name, member in sheets:
+        r = convert_sheet(conn, zf, name, member, shared, date_styles, epoch, opts, taken)
+        if r:
+            results.append(r)
+    conn.execute("PRAGMA journal_mode=WAL")
+
+    print(f"\nDONE -> {out} ({os.path.getsize(out) / 1e9:.2f} GB)")
+    for table, count, headers in results:
+        print(f"  {table}: {count:,} rows, columns: {headers}")
+        for row in conn.execute(f'SELECT * FROM "{table}" LIMIT {opts.sample}'):
+            print("    " + " | ".join(str(v)[:60] for v in row))
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()

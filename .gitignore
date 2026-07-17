@@ -1,0 +1,17 @@
+# data files never belong in this repo
+*.xlsx
+*.xls
+*.xlsb
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+~$*
+
+# build artifacts
+*.skill
+
+# local tooling state
+.claude/
+__pycache__/
+.DS_Store
